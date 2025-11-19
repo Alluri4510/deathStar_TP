@@ -1,0 +1,281 @@
+    
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+import uvicorn
+import os
+import shutil
+import subprocess
+import cv2
+import tensorflow as tf
+import numpy as np
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing import image
+
+import sys
+sys.path.append(".")
+from imagecroping import crop_red_circle
+
+cropped_image_folder = None
+third_prefix = None
+
+def bash(command, log_filename):
+    process = subprocess.run(command, shell=True, capture_output=True, text=True)
+
+    log = open(log_filename, "a")
+    if process.returncode == 0:
+        log.write(process.stdout)
+    else:
+        log.write(process.stderr)
+    log.close()
+    return process.stdout
+    
+# Wait for zigbee signal; return true if zigbee signal returns positive
+# Return false if zigbee signal returns false
+def notify_zigbee():
+    # Send hash to Raspberry Pi
+    print("zigbeeeeee")
+
+def collect_data(destination_dirname, filename):
+    # Collect data from receiver circuit in buffer
+    # Convert buffer to raw binary file
+    print("collected new file")
+    shutil.copy2(f"/media/team11/USB20FD/results/{filename}", f"{destination_dirname}/{filename}")
+    return calculate_md5(f"{destination_dirname}\{filename}", "log.txt")
+    
+def crop_images(source_dirname, destination_dirname, prefix):
+    # Ensure destination and source directory exists
+    if not os.path.exists(source_dirname):
+        print("ERROR: source not found", source_dirname)
+        return
+    if not os.path.exists(destination_dirname):
+        os.makedirs(destination_dirname)
+    print("Cropping images...")
+    index_cnt = 0
+    
+    for filename in os.listdir(source_dirname):
+        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+            image_path = os.path.join(source_dirname, filename)
+            
+            # Extract file ID from the filename
+            if '_' in filename:
+                file_id = filename.split('_', 1)[1]
+            else:
+                print(f"Skipping {filename}: Unexpected format")
+                continue
+                
+            # Create the output filename with the new prefix
+            output_filename = f"{prefix}_{index_cnt}.png"
+            output_path = os.path.join(destination_dirname, output_filename)
+            index_cnt += 1
+            
+            # Load the image with all channels (including alpha if present)
+            image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+            
+            if image is None:
+                print(f"Error: unable to load image {filename}.")
+                continue
+                
+            # Ensure the image has an alpha channel (transparency support)
+            if image.shape[-1] == 3:  # If only BGR (3 channels), add an alpha channel
+                b, g, r = cv2.split(image)
+                alpha = np.ones(b.shape, dtype=b.dtype) * 255  # Fully opaque
+                image = cv2.merge((b, g, r, alpha))
+                
+            # Convert image to HSV color space for better red color detection
+            hsv = cv2.cvtColor(image[:, :, :3], cv2.COLOR_BGR2HSV)
+            
+            # Define two ranges for detecting red color (since red wraps around in HSV)
+            lower_red1 = np.array([0, 120, 70])
+            upper_red1 = np.array([10, 255, 255])
+            lower_red2 = np.array([170, 120, 70])
+            upper_red2 = np.array([180, 255, 255])
+            
+            # Create masks for red color
+            mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+            mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+            mask = cv2.bitwise_or(mask1, mask2)  # Combine both masks
+            
+            # Find contours in the red mask
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if not contours:
+                print(f"Error: unable to find contours in {filename}.")
+                continue
+                
+            # Find the largest contour (assumed to be the main red circle)
+            max_contour = max(contours, key=cv2.contourArea)
+            
+            # Get the minimum enclosing circle for the detected contour
+            (x, y), radius = cv2.minEnclosingCircle(max_contour)
+            x, y, radius = int(x), int(y), int(radius)  # Convert to integer values
+            
+            # Define the bounding box for cropping
+            x1, y1 = max(0, x - radius), max(0, y - radius)
+            x2, y2 = min(image.shape[1], x + radius), min(image.shape[0], y + radius)
+            
+            # Ensure a valid cropping image
+            cropped_image = image[y1:y2, x1:x2].copy()
+            
+            if cropped_image.size == 0:
+                print(f"Error: unable to crop {filename}.")
+                continue
+                
+            # Create a circular mask the same size as the cropped image
+            mask = np.zeros((cropped_image.shape[0], cropped_image.shape[1]), dtype=np.uint8)
+            circle_center = (cropped_image.shape[1] // 2, cropped_image.shape[0] // 2)
+            cv2.circle(mask, circle_center, radius, 255, -1)  # Draw a filled white circle
+            
+            # Apply the circular mask to the alpha channel
+            b, g, r, a = cv2.split(cropped_image)
+            a[mask == 0] = 0  # Set all pixels outside the circle to fully transparent
+            cropped_rgba = cv2.merge((b, g, r, a))
+            
+            # Resize the cropped image to 128x128
+            cropped_rgba = cv2.resize(cropped_rgba, (128, 128), interpolation=cv2.INTER_LANCZOS4)
+            
+            # Save the final cropped image with transparency as a PNG
+            cv2.imwrite(output_path, cropped_rgba)
+            print(f"Saved cropped image to {output_path}")
+    
+    
+    print("All images have been cropped and renamed.")
+    
+def decrypt_images(source_dirname, destination_dirname, prefix, log_filename, dec_key, iv):
+    # Ensure the destination directory exists
+    if not os.path.exists(source_dirname):
+        print("ERROR: source not found", source_dirname)
+        return
+    if not os.path.exists(destination_dirname):
+        os.makedirs(destination_dirname)
+    print("Decrypting images...")
+
+    # Loop through all files in the source directory
+    for file_name in os.listdir(source_dirname):
+        if len(file_name) > 2 and file_name[1] == '_':  # Ensures correct file format
+            file_id = file_name[2:]  # Extract file ID (e.g., "123.png")
+
+            # Construct the new file name with the given prefix
+            new_file_name = f"{prefix}_{file_id}.png"
+            
+            # Define source and destination file paths
+            source_path = os.path.join(source_dirname, file_name)
+            destination_path = os.path.join(destination_dirname, new_file_name)
+
+            # Bash command for AES-256 decryption in OFB mode
+            bash_command = (
+                f"openssl enc -d -aes-256-ofb -in '{source_path}' -out '{destination_path}' "
+                f"-K '{dec_key}' -iv '{iv}'"
+            )
+
+            # Execute the bash command using the provided bash function
+            bash(bash_command, log_filename)
+            print(f"Decrypted and restored: {source_path} -> {destination_path}")
+
+    print("All images have been decrypted and transferred!")
+    
+def calculate_md5(source_filename, log_filename):
+
+    bash_command = f"openssl md5 '{source_filename}'"
+            
+    # Execute the command and capture the output
+    hash_result = bash(bash_command, log_filename).strip()
+
+    print(f"Hashed: {source_filename}")
+    return hash_result
+
+
+cropped_image_folder = None
+    
+app = FastAPI()
+@app.get("/")
+def root():
+    return {"message": "Welcome to the Rebel App!"}
+
+@app.get("/images/{image_index}")
+def get_image(image_index: str):
+    image_path = os.path.join(cropped_image_folder, third_prefix + "_" + image_index + ".png")
+    print(image_path)
+
+    if not os.path.exists(image_path):
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return FileResponse(image_path, media_type="image/png")
+
+'''
+This is the master program to be executed on the server at test time. It takes
+a high-level approach and performs each protocol separately. For more information
+on each protocol, please access "Software Granular Description" on Lucidchart
+'''
+if __name__ == "__main__":
+    
+    print("testing")
+    '''
+    fourth_prefix = "t"
+    cropped_image_folder = "test/cropped_imgs/"
+    crop_images("../Cropping_Code/code/Input_File", "test/cropped_imgs", "t")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    '''
+    # anu testing
+    """ print("Testing image processing pipeline")
+    source_dir = "/Users/raj/Desktop/server_try/Positive_negative_mix"
+    processed_dir = "processed"
+    cropped_dir = "cropped"
+    prefix = "x_"
+    
+    # Step 1: Preprocess images to identify Death Star weak points
+    preprocess_images(source_dir, processed_dir, prefix)
+    
+    # Step 2: Crop red circles from the preprocessed images
+    crop_images(processed_dir, cropped_dir, prefix)
+    
+    print("Processing pipeline complete") """
+
+
+    
+    
+    
+    first_prefix = "r"
+    encrypted_image_folder = "/media/team11/USB20FD/results"
+    
+    # Files that have just been collected from the phototransistor circuit will appear
+    # with this prefix conjoined to their ID in the specified destination folder
+    second_prefix = "s"
+    decrypted_image_folder = "./results/targets"
+    
+    # Cropped files will appear with this prefix conjoined to their ID in the specified destination folder
+    third_prefix = "x"
+    cropped_image_folder = "./results/cropped"
+    
+    log_filename = "log.txt"
+    encryption_key = 248 # Must be 32 bytes for AES-256
+    initialization_vec = 123
+    IDindex = 0
+    correct = True
+    
+    # PROTOCOL #1
+    # Begin loop of decoding encrypted data
+    # for filename in os.listdir(encrypted_image_folder):
+    #     md5_hash_from_transmission = collect_data(encrypted_image_folder, filename)
+    #     md5_hash_from_local = calculate_md5(f"{encrypted_image_folder}/{filename}", log_filename)
+    #     if md5_hash_from_transmission == md5_hash_from_local:
+    #         notify_zigbee()
+    #         IDindex += 1
+    #         if IDindex >= 10:
+    #             break
+    #     else:
+    #         os.remove(f"{encrypted_image_folder}/{filename}")
+    #         continue
+    
+    # PROTOCOL #2
+    decrypt_images(encrypted_image_folder, decrypted_image_folder, second_prefix, log_filename, 0x0123456789abcdef, 0x0123456789abcdef)
+    
+    # PROTOCOL #3
+    crop_images(decrypted_image_folder, cropped_image_folder, third_prefix)
+    
+    # PROTOCOL #4
+    # Host images on server
+    command = f"scp -i ARA.pem {cropped_image_folder}/*.png ec2-user@ec2-52-14-176-71.us-east-2.compute.amazonaws.com:/home/ec2-user/deathstarApi/"
+    bash(command, log_filename)
+    
+    
+    print("done")
